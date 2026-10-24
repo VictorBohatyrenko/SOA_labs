@@ -1,0 +1,113 @@
+name: med-notebook
+
+# Спільні налаштування для всіх доменних сервісів
+x-service: &service
+  restart: unless-stopped
+  networks: [backend]
+  depends_on:
+    consul:
+      condition: service_healthy
+    postgres:
+      condition: service_healthy
+    rabbitmq:
+      condition: service_healthy
+
+x-env: &env
+  CONSUL_URL: http://consul:8500
+  RABBIT_URL: amqp://guest:guest@rabbitmq:5672/%2F
+
+services:
+  # ---------- Інфраструктура ----------
+  consul:                      # Service discovery (реєстр сервісів)
+    image: hashicorp/consul:1.19
+    command: agent -dev -client=0.0.0.0 -ui
+    ports: ["8500:8500"]       # UI: http://localhost:8500
+    networks: [backend]
+    healthcheck:
+      test: ["CMD", "consul", "members"]
+      interval: 5s
+      retries: 10
+
+  gateway:                     # API Gateway / edge service + балансувальник
+    image: traefik:v3.1
+    command:
+      - --api.insecure=true
+      - --entrypoints.web.address=:80
+      - --providers.consulcatalog=true
+      - --providers.consulcatalog.endpoint.address=consul:8500
+      - --providers.consulcatalog.exposedByDefault=false
+      - --providers.consulcatalog.refreshInterval=5s
+      - --accesslog=true
+    ports:
+      - "8000:80"              # єдина точка входу: http://localhost:8000/api/...
+      - "8080:8080"            # дашборд Traefik
+    networks: [backend]
+    depends_on:
+      consul:
+        condition: service_healthy
+
+  rabbitmq:                    # Message broker
+    image: rabbitmq:3.13-management
+    ports:
+      - "5672:5672"
+      - "15672:15672"          # UI: http://localhost:15672 (guest/guest)
+    networks: [backend]
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 10s
+      retries: 10
+
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: med
+      POSTGRES_PASSWORD: med
+    volumes:
+      - ./infra/postgres/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+      - pgdata:/var/lib/postgresql/data
+    networks: [backend]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U med"]
+      interval: 5s
+      retries: 10
+
+  # ---------- Доменні сервіси ----------
+  patients:
+    <<: *service
+    build: { context: ., dockerfile: services/patients/Dockerfile }
+    environment:
+      <<: *env
+      DATABASE_URL: postgresql://med:med@postgres:5432/patients_db
+
+  prescriptions:
+    <<: *service
+    build: { context: ., dockerfile: services/prescriptions/Dockerfile }
+    environment:
+      <<: *env
+      DATABASE_URL: postgresql://med:med@postgres:5432/prescriptions_db
+
+  notes:
+    <<: *service
+    build: { context: ., dockerfile: services/notes/Dockerfile }
+    environment:
+      <<: *env
+      DATABASE_URL: postgresql://med:med@postgres:5432/notes_db
+
+  audit:
+    <<: *service
+    build: { context: ., dockerfile: services/audit/Dockerfile }
+    environment:
+      <<: *env
+      DATABASE_URL: postgresql://med:med@postgres:5432/audit_db
+
+  notifications:
+    <<: *service
+    build: { context: ., dockerfile: services/notifications/Dockerfile }
+    environment:
+      <<: *env
+
+networks:
+  backend:
+
+volumes:
+  pgdata:
